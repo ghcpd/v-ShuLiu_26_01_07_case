@@ -128,6 +128,31 @@ class ApiEngine:
             },
         )
 
+    def _prepare_call(self, ctx: Dict[str, Any], endpoint_name: str, raw_payload: str) -> tuple[Optional[_RequestContext], Optional[Dict[str, Any]]]:
+        """Prepare common request context. Returns (request_ctx, error_response).
+
+        If successful, error_response is None.
+        If failed, request_ctx is None and error_response is the error dict.
+        """
+        endpoint = self._resolve_endpoint(endpoint_name)
+        if endpoint is None:
+            return None, {
+                "ok": False,
+                "status": None,
+                "data": None,
+                "error": "unknown_endpoint",
+            }
+
+        parsed, parse_error = self._parse_payload(endpoint_name, raw_payload)
+        if parse_error is not None:
+            return None, parse_error
+
+        headers = self._build_headers(ctx, endpoint)
+        self._emit_request_build(endpoint_name, endpoint, headers)
+
+        request_ctx = _RequestContext(endpoint_name, endpoint, parsed, headers)
+        return request_ctx, None
+
     def _normalize_response_body(self, body: Any) -> tuple[Any, Optional[str]]:
         """Normalize response body (parse JSON if needed).
 
@@ -180,31 +205,14 @@ class ApiEngine:
 
     # Result shape is intentionally simple but stable.
     def call_sync(self, ctx: Dict[str, Any], endpoint_name: str, raw_payload: str) -> Dict[str, Any]:
-        # Resolve endpoint
-        endpoint = self._resolve_endpoint(endpoint_name)
-        if endpoint is None:
-            return {
-                "ok": False,
-                "status": None,
-                "data": None,
-                "error": "unknown_endpoint",
-            }
-
-        # Parse payload
-        parsed, parse_error = self._parse_payload(endpoint_name, raw_payload)
-        if parse_error is not None:
-            return parse_error
-
-        # Build headers
-        headers = self._build_headers(ctx, endpoint)
-        self._emit_request_build(endpoint_name, endpoint, headers)
+        request_ctx, error = self._prepare_call(ctx, endpoint_name, raw_payload)
+        if error is not None:
+            return error
 
         # Execute request with retry logic
-        return self._execute_sync_with_retry(endpoint_name, endpoint, headers, parsed)
+        return self._execute_sync_with_retry(request_ctx)
 
-    def _execute_sync_with_retry(
-        self, endpoint_name: str, endpoint: EndpointConfig, headers: Dict[str, str], parsed_payload: Any
-    ) -> Dict[str, Any]:
+    def _execute_sync_with_retry(self, request_ctx: _RequestContext) -> Dict[str, Any]:
         """Execute sync request with retry logic."""
         attempt = 0
         while True:
@@ -212,28 +220,28 @@ class ApiEngine:
             self._tracer.emit(
                 "request.start",
                 {
-                    "endpoint": endpoint_name,
+                    "endpoint": request_ctx.endpoint_name,
                     "attempt": attempt,
                 },
             )
             try:
                 response = self._transport.sync_request(
-                    method=endpoint.method,
-                    url=endpoint.url,
-                    headers=headers,
-                    json_body=parsed_payload,
-                    timeout=endpoint.timeout,
+                    method=request_ctx.endpoint.method,
+                    url=request_ctx.endpoint.url,
+                    headers=request_ctx.headers,
+                    json_body=request_ctx.parsed_payload,
+                    timeout=request_ctx.endpoint.timeout,
                 )
             except TimeoutError:
                 self._tracer.emit(
                     "request.error",
                     {
-                        "endpoint": endpoint_name,
+                        "endpoint": request_ctx.endpoint_name,
                         "attempt": attempt,
                         "category": "timeout",
                     },
                 )
-                if attempt > endpoint.retries:
+                if attempt > request_ctx.endpoint.retries:
                     return {
                         "ok": False,
                         "status": None,
@@ -245,7 +253,7 @@ class ApiEngine:
                 self._tracer.emit(
                     "request.error",
                     {
-                        "endpoint": endpoint_name,
+                        "endpoint": request_ctx.endpoint_name,
                         "attempt": attempt,
                         "category": "network_error",
                         "message": str(exc),
@@ -263,18 +271,18 @@ class ApiEngine:
             self._tracer.emit(
                 "request.end",
                 {
-                    "endpoint": endpoint_name,
+                    "endpoint": request_ctx.endpoint_name,
                     "attempt": attempt,
                     "status": status,
                 },
             )
 
             # Check if we should retry
-            if status in endpoint.retry_statuses and attempt <= endpoint.retries:
+            if status in request_ctx.endpoint.retry_statuses and attempt <= request_ctx.endpoint.retries:
                 self._tracer.emit(
                     "request.retry",
                     {
-                        "endpoint": endpoint_name,
+                        "endpoint": request_ctx.endpoint_name,
                         "attempt": attempt,
                         "status": status,
                     },
@@ -282,7 +290,7 @@ class ApiEngine:
                 continue
 
             # Normalize and return response
-            return self._normalize_and_return_response(endpoint_name, status, body)
+            return self._normalize_and_return_response(request_ctx.endpoint_name, status, body)
 
     def _normalize_and_return_response(self, endpoint_name: str, status: int, body: Any) -> Dict[str, Any]:
         """Normalize response body and return appropriate result based on status."""
@@ -312,31 +320,14 @@ class ApiEngine:
             return self._handle_error_response(endpoint_name, status, data, "upstream_error")
 
     async def call_async(self, ctx: Dict[str, Any], endpoint_name: str, raw_payload: str) -> Dict[str, Any]:
-        # Resolve endpoint
-        endpoint = self._resolve_endpoint(endpoint_name)
-        if endpoint is None:
-            return {
-                "ok": False,
-                "status": None,
-                "data": None,
-                "error": "unknown_endpoint",
-            }
-
-        # Parse payload
-        parsed, parse_error = self._parse_payload(endpoint_name, raw_payload)
-        if parse_error is not None:
-            return parse_error
-
-        # Build headers
-        headers = self._build_headers(ctx, endpoint)
-        self._emit_request_build(endpoint_name, endpoint, headers)
+        request_ctx, error = self._prepare_call(ctx, endpoint_name, raw_payload)
+        if error is not None:
+            return error
 
         # Execute request with retry logic
-        return await self._execute_async_with_retry(endpoint_name, endpoint, headers, parsed)
+        return await self._execute_async_with_retry(request_ctx)
 
-    async def _execute_async_with_retry(
-        self, endpoint_name: str, endpoint: EndpointConfig, headers: Dict[str, str], parsed_payload: Any
-    ) -> Dict[str, Any]:
+    async def _execute_async_with_retry(self, request_ctx: _RequestContext) -> Dict[str, Any]:
         """Execute async request with retry logic."""
         attempt = 0
         while True:
@@ -344,28 +335,28 @@ class ApiEngine:
             self._tracer.emit(
                 "request.start",
                 {
-                    "endpoint": endpoint_name,
+                    "endpoint": request_ctx.endpoint_name,
                     "attempt": attempt,
                 },
             )
             try:
                 response = await self._transport.async_request(
-                    method=endpoint.method,
-                    url=endpoint.url,
-                    headers=headers,
-                    json_body=parsed_payload,
-                    timeout=endpoint.timeout,
+                    method=request_ctx.endpoint.method,
+                    url=request_ctx.endpoint.url,
+                    headers=request_ctx.headers,
+                    json_body=request_ctx.parsed_payload,
+                    timeout=request_ctx.endpoint.timeout,
                 )
             except asyncio.TimeoutError:
                 self._tracer.emit(
                     "request.error",
                     {
-                        "endpoint": endpoint_name,
+                        "endpoint": request_ctx.endpoint_name,
                         "attempt": attempt,
                         "category": "timeout",
                     },
                 )
-                if attempt > endpoint.retries:
+                if attempt > request_ctx.endpoint.retries:
                     return {
                         "ok": False,
                         "status": None,
@@ -377,7 +368,7 @@ class ApiEngine:
                 self._tracer.emit(
                     "request.error",
                     {
-                        "endpoint": endpoint_name,
+                        "endpoint": request_ctx.endpoint_name,
                         "attempt": attempt,
                         "category": "network_error",
                         "message": str(exc),
@@ -395,18 +386,18 @@ class ApiEngine:
             self._tracer.emit(
                 "request.end",
                 {
-                    "endpoint": endpoint_name,
+                    "endpoint": request_ctx.endpoint_name,
                     "attempt": attempt,
                     "status": status,
                 },
             )
 
             # Check if we should retry
-            if status in endpoint.retry_statuses and attempt <= endpoint.retries:
+            if status in request_ctx.endpoint.retry_statuses and attempt <= request_ctx.endpoint.retries:
                 self._tracer.emit(
                     "request.retry",
                     {
-                        "endpoint": endpoint_name,
+                        "endpoint": request_ctx.endpoint_name,
                         "attempt": attempt,
                         "status": status,
                     },
@@ -414,4 +405,4 @@ class ApiEngine:
                 continue
 
             # Normalize and return response
-            return self._normalize_and_return_response(endpoint_name, status, body)
+            return self._normalize_and_return_response(request_ctx.endpoint_name, status, body)
