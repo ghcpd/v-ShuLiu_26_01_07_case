@@ -33,12 +33,31 @@ class TraceSink:
         self.events.append(data)
 
 
+class _RequestContext:
+    """Internal class that holds state for a single request operation.
+
+    Centralizes parsed endpoint, headers, and payload to avoid
+    re-computing or re-passing them through the call stack.
+    """
+
+    def __init__(
+        self,
+        endpoint_name: str,
+        endpoint: EndpointConfig,
+        parsed_payload: Any,
+        headers: Dict[str, str],
+    ) -> None:
+        self.endpoint_name = endpoint_name
+        self.endpoint = endpoint
+        self.parsed_payload = parsed_payload
+        self.headers = headers
+
+
 class ApiEngine:
     """Simple API orchestration layer.
 
-    This implementation is intentionally a bit repetitive between
-    call_sync and call_async so that it can be refactored later
-    without changing behavior.
+    This implementation centralizes common request/response logic
+    to reduce duplication between sync and async paths.
     """
 
     def __init__(
@@ -57,43 +76,49 @@ class ApiEngine:
     def tracer(self) -> TraceSink:
         return self._tracer
 
-    # Result shape is intentionally simple but stable.
-    def call_sync(self, ctx: Dict[str, Any], endpoint_name: str, raw_payload: str) -> Dict[str, Any]:
-        tracer = self._tracer
-        tracer.emit("resolve.start", {"endpoint": endpoint_name})
-
+    def _resolve_endpoint(self, endpoint_name: str) -> Optional[EndpointConfig]:
+        """Resolve endpoint config by name. Emits trace events."""
+        self._tracer.emit("resolve.start", {"endpoint": endpoint_name})
         endpoint = self._endpoints.get(endpoint_name)
         if endpoint is None:
-            tracer.emit("resolve.error", {"endpoint": endpoint_name, "error": "unknown_endpoint"})
-            return {
-                "ok": False,
-                "status": None,
-                "data": None,
-                "error": "unknown_endpoint",
-            }
+            self._tracer.emit("resolve.error", {"endpoint": endpoint_name, "error": "unknown_endpoint"})
+            return None
+        self._tracer.emit("resolve.done", {"endpoint": endpoint_name})
+        return endpoint
 
-        tracer.emit("resolve.done", {"endpoint": endpoint_name})
+    def _parse_payload(self, endpoint_name: str, raw_payload: str) -> tuple[Optional[Any], Optional[Dict[str, Any]]]:
+        """Parse raw_payload as JSON. Returns (parsed_data, error_response).
 
-        # Parse payload
+        If parsing succeeds, error_response is None.
+        If parsing fails, returns (None, error_response) with the error already traced.
+        """
         try:
             parsed = json.loads(raw_payload) if raw_payload is not None else None
+            return parsed, None
         except json.JSONDecodeError as exc:
-            tracer.emit("payload.error", {"endpoint": endpoint_name, "error": "bad_payload", "message": str(exc)})
-            return {
+            self._tracer.emit(
+                "payload.error",
+                {"endpoint": endpoint_name, "error": "bad_payload", "message": str(exc)},
+            )
+            return None, {
                 "ok": False,
                 "status": None,
                 "data": None,
                 "error": "bad_payload",
             }
 
-        # Build headers with precedence: engine defaults < endpoint headers < ctx overrides
+    def _build_headers(self, ctx: Dict[str, Any], endpoint: EndpointConfig) -> Dict[str, str]:
+        """Build merged headers: defaults < endpoint < ctx overrides."""
         ctx_headers = ctx.get("headers") or {}
         headers: Dict[str, str] = {}
         headers.update(self._default_headers)
         headers.update(endpoint.headers)
         headers.update(ctx_headers)
+        return headers
 
-        tracer.emit(
+    def _emit_request_build(self, endpoint_name: str, endpoint: EndpointConfig, headers: Dict[str, str]) -> None:
+        """Emit request.build trace event."""
+        self._tracer.emit(
             "request.build",
             {
                 "endpoint": endpoint_name,
@@ -103,11 +128,88 @@ class ApiEngine:
             },
         )
 
+    def _normalize_response_body(self, body: Any) -> tuple[Any, Optional[str]]:
+        """Normalize response body (parse JSON if needed).
+
+        Returns (data, error_string).
+        If successful, error_string is None.
+        If JSON parsing fails, returns (None, 'bad_response_json').
+        """
+        try:
+            data = json.loads(body) if isinstance(body, str) and body else body
+            return data, None
+        except json.JSONDecodeError:
+            return None, "bad_response_json"
+
+    def _handle_success_response(
+        self, endpoint_name: str, status: int, data: Any
+    ) -> Dict[str, Any]:
+        """Handle successful (2xx) response."""
+        self._tracer.emit(
+            "response.ok",
+            {
+                "endpoint": endpoint_name,
+                "status": status,
+            },
+        )
+        return {
+            "ok": True,
+            "status": status,
+            "data": data,
+            "error": None,
+        }
+
+    def _handle_error_response(
+        self, endpoint_name: str, status: int, data: Any, error_type: str
+    ) -> Dict[str, Any]:
+        """Handle error response."""
+        self._tracer.emit(
+            "response.error",
+            {
+                "endpoint": endpoint_name,
+                "status": status,
+                "category": error_type,
+            },
+        )
+        return {
+            "ok": False,
+            "status": status,
+            "data": data,
+            "error": f"{error_type}:{status}",
+        }
+
+    # Result shape is intentionally simple but stable.
+    def call_sync(self, ctx: Dict[str, Any], endpoint_name: str, raw_payload: str) -> Dict[str, Any]:
+        # Resolve endpoint
+        endpoint = self._resolve_endpoint(endpoint_name)
+        if endpoint is None:
+            return {
+                "ok": False,
+                "status": None,
+                "data": None,
+                "error": "unknown_endpoint",
+            }
+
+        # Parse payload
+        parsed, parse_error = self._parse_payload(endpoint_name, raw_payload)
+        if parse_error is not None:
+            return parse_error
+
+        # Build headers
+        headers = self._build_headers(ctx, endpoint)
+        self._emit_request_build(endpoint_name, endpoint, headers)
+
+        # Execute request with retry logic
+        return self._execute_sync_with_retry(endpoint_name, endpoint, headers, parsed)
+
+    def _execute_sync_with_retry(
+        self, endpoint_name: str, endpoint: EndpointConfig, headers: Dict[str, str], parsed_payload: Any
+    ) -> Dict[str, Any]:
+        """Execute sync request with retry logic."""
         attempt = 0
-        last_error: Optional[str] = None
         while True:
             attempt += 1
-            tracer.emit(
+            self._tracer.emit(
                 "request.start",
                 {
                     "endpoint": endpoint_name,
@@ -119,11 +221,11 @@ class ApiEngine:
                     method=endpoint.method,
                     url=endpoint.url,
                     headers=headers,
-                    json_body=parsed,
+                    json_body=parsed_payload,
                     timeout=endpoint.timeout,
                 )
             except TimeoutError:
-                tracer.emit(
+                self._tracer.emit(
                     "request.error",
                     {
                         "endpoint": endpoint_name,
@@ -131,7 +233,6 @@ class ApiEngine:
                         "category": "timeout",
                     },
                 )
-                last_error = "timeout"
                 if attempt > endpoint.retries:
                     return {
                         "ok": False,
@@ -141,7 +242,7 @@ class ApiEngine:
                     }
                 continue
             except Exception as exc:  # noqa: BLE001
-                tracer.emit(
+                self._tracer.emit(
                     "request.error",
                     {
                         "endpoint": endpoint_name,
@@ -150,17 +251,16 @@ class ApiEngine:
                         "message": str(exc),
                     },
                 )
-                last_error = "network_error"
                 return {
                     "ok": False,
                     "status": None,
                     "data": None,
-                    "error": last_error,
+                    "error": "network_error",
                 }
 
             status = response.get("status")
             body = response.get("body")
-            tracer.emit(
+            self._tracer.emit(
                 "request.end",
                 {
                     "endpoint": endpoint_name,
@@ -169,8 +269,9 @@ class ApiEngine:
                 },
             )
 
+            # Check if we should retry
             if status in endpoint.retry_statuses and attempt <= endpoint.retries:
-                tracer.emit(
+                self._tracer.emit(
                     "request.retry",
                     {
                         "endpoint": endpoint_name,
@@ -178,67 +279,42 @@ class ApiEngine:
                         "status": status,
                     },
                 )
-                last_error = f"http_{status}"
                 continue
 
-            # Normalize response
-            try:
-                data = json.loads(body) if isinstance(body, str) and body else body
-            except json.JSONDecodeError as exc:  # malformed JSON from upstream
-                tracer.emit(
-                    "response.error",
-                    {
-                        "endpoint": endpoint_name,
-                        "status": status,
-                        "category": "bad_response_json",
-                        "message": str(exc),
-                    },
-                )
-                return {
-                    "ok": False,
-                    "status": status,
-                    "data": None,
-                    "error": "bad_response_json",
-                }
+            # Normalize and return response
+            return self._normalize_and_return_response(endpoint_name, status, body)
 
-            if 200 <= status < 300:
-                tracer.emit(
-                    "response.ok",
-                    {
-                        "endpoint": endpoint_name,
-                        "status": status,
-                    },
-                )
-                return {
-                    "ok": True,
-                    "status": status,
-                    "data": data,
-                    "error": None,
-                }
-
-            # non‑2xx final error
-            tracer.emit(
+    def _normalize_and_return_response(self, endpoint_name: str, status: int, body: Any) -> Dict[str, Any]:
+        """Normalize response body and return appropriate result based on status."""
+        data, normalize_error = self._normalize_response_body(body)
+        
+        if normalize_error:
+            # JSON decode error from upstream
+            self._tracer.emit(
                 "response.error",
                 {
                     "endpoint": endpoint_name,
                     "status": status,
-                    "category": "upstream_error",
+                    "category": normalize_error,
                 },
             )
             return {
                 "ok": False,
                 "status": status,
-                "data": data,
-                "error": f"upstream_error:{status}",
+                "data": None,
+                "error": normalize_error,
             }
 
-    async def call_async(self, ctx: Dict[str, Any], endpoint_name: str, raw_payload: str) -> Dict[str, Any]:
-        tracer = self._tracer
-        tracer.emit("resolve.start", {"endpoint": endpoint_name})
+        if 200 <= status < 300:
+            return self._handle_success_response(endpoint_name, status, data)
+        else:
+            # non-2xx final error
+            return self._handle_error_response(endpoint_name, status, data, "upstream_error")
 
-        endpoint = self._endpoints.get(endpoint_name)
+    async def call_async(self, ctx: Dict[str, Any], endpoint_name: str, raw_payload: str) -> Dict[str, Any]:
+        # Resolve endpoint
+        endpoint = self._resolve_endpoint(endpoint_name)
         if endpoint is None:
-            tracer.emit("resolve.error", {"endpoint": endpoint_name, "error": "unknown_endpoint"})
             return {
                 "ok": False,
                 "status": None,
@@ -246,40 +322,26 @@ class ApiEngine:
                 "error": "unknown_endpoint",
             }
 
-        tracer.emit("resolve.done", {"endpoint": endpoint_name})
+        # Parse payload
+        parsed, parse_error = self._parse_payload(endpoint_name, raw_payload)
+        if parse_error is not None:
+            return parse_error
 
-        try:
-            parsed = json.loads(raw_payload) if raw_payload is not None else None
-        except json.JSONDecodeError as exc:
-            tracer.emit("payload.error", {"endpoint": endpoint_name, "error": "bad_payload", "message": str(exc)})
-            return {
-                "ok": False,
-                "status": None,
-                "data": None,
-                "error": "bad_payload",
-            }
+        # Build headers
+        headers = self._build_headers(ctx, endpoint)
+        self._emit_request_build(endpoint_name, endpoint, headers)
 
-        ctx_headers = ctx.get("headers") or {}
-        headers: Dict[str, str] = {}
-        headers.update(self._default_headers)
-        headers.update(endpoint.headers)
-        headers.update(ctx_headers)
+        # Execute request with retry logic
+        return await self._execute_async_with_retry(endpoint_name, endpoint, headers, parsed)
 
-        tracer.emit(
-            "request.build",
-            {
-                "endpoint": endpoint_name,
-                "method": endpoint.method,
-                "url": endpoint.url,
-                "headers": headers,
-            },
-        )
-
+    async def _execute_async_with_retry(
+        self, endpoint_name: str, endpoint: EndpointConfig, headers: Dict[str, str], parsed_payload: Any
+    ) -> Dict[str, Any]:
+        """Execute async request with retry logic."""
         attempt = 0
-        last_error: Optional[str] = None
         while True:
             attempt += 1
-            tracer.emit(
+            self._tracer.emit(
                 "request.start",
                 {
                     "endpoint": endpoint_name,
@@ -291,11 +353,11 @@ class ApiEngine:
                     method=endpoint.method,
                     url=endpoint.url,
                     headers=headers,
-                    json_body=parsed,
+                    json_body=parsed_payload,
                     timeout=endpoint.timeout,
                 )
             except asyncio.TimeoutError:
-                tracer.emit(
+                self._tracer.emit(
                     "request.error",
                     {
                         "endpoint": endpoint_name,
@@ -303,7 +365,6 @@ class ApiEngine:
                         "category": "timeout",
                     },
                 )
-                last_error = "timeout"
                 if attempt > endpoint.retries:
                     return {
                         "ok": False,
@@ -313,7 +374,7 @@ class ApiEngine:
                     }
                 continue
             except Exception as exc:  # noqa: BLE001
-                tracer.emit(
+                self._tracer.emit(
                     "request.error",
                     {
                         "endpoint": endpoint_name,
@@ -322,17 +383,16 @@ class ApiEngine:
                         "message": str(exc),
                     },
                 )
-                last_error = "network_error"
                 return {
                     "ok": False,
                     "status": None,
                     "data": None,
-                    "error": last_error,
+                    "error": "network_error",
                 }
 
             status = response.get("status")
             body = response.get("body")
-            tracer.emit(
+            self._tracer.emit(
                 "request.end",
                 {
                     "endpoint": endpoint_name,
@@ -341,8 +401,9 @@ class ApiEngine:
                 },
             )
 
+            # Check if we should retry
             if status in endpoint.retry_statuses and attempt <= endpoint.retries:
-                tracer.emit(
+                self._tracer.emit(
                     "request.retry",
                     {
                         "endpoint": endpoint_name,
@@ -350,54 +411,7 @@ class ApiEngine:
                         "status": status,
                     },
                 )
-                last_error = f"http_{status}"
                 continue
 
-            try:
-                data = json.loads(body) if isinstance(body, str) and body else body
-            except json.JSONDecodeError as exc:
-                tracer.emit(
-                    "response.error",
-                    {
-                        "endpoint": endpoint_name,
-                        "status": status,
-                        "category": "bad_response_json",
-                        "message": str(exc),
-                    },
-                )
-                return {
-                    "ok": False,
-                    "status": status,
-                    "data": None,
-                    "error": "bad_response_json",
-                }
-
-            if 200 <= status < 300:
-                tracer.emit(
-                    "response.ok",
-                    {
-                        "endpoint": endpoint_name,
-                        "status": status,
-                    },
-                )
-                return {
-                    "ok": True,
-                    "status": status,
-                    "data": data,
-                    "error": None,
-                }
-
-            tracer.emit(
-                "response.error",
-                {
-                    "endpoint": endpoint_name,
-                    "status": status,
-                    "category": "upstream_error",
-                },
-            )
-            return {
-                "ok": False,
-                "status": status,
-                "data": data,
-                "error": f"upstream_error:{status}",
-            }
+            # Normalize and return response
+            return self._normalize_and_return_response(endpoint_name, status, body)

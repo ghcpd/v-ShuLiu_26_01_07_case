@@ -112,6 +112,7 @@ def test_retry_and_timeout_mapping_sync() -> None:
 async def test_async_behaves_like_sync_success() -> None:
     engine = make_engine()
     engine._transport.queue_response("/ok", {"status": 200, "body": json.dumps({"v": 1})})
+    engine._transport.queue_response("/ok", {"status": 200, "body": json.dumps({"v": 1})})
 
     sync_result = engine.call_sync({}, "ok", "{}")
     async_result = await engine.call_async({}, "ok", "{}")
