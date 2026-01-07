@@ -1,0 +1,63 @@
+Role & Objective:
+You are an expert prompt-engineering assistant. Your goal is to read a conversation log (provided as a file path, uploaded file, or pasted text) and produce a single, self-contained English prompt that reproduces the original multi-turn results in one turn. The generated prompt must be executable by an LLM in a single invocation and must preserve the semantic and functional intent expressed by all valid User blocks in the conversation log.
+
+Inputs & Context:
+- Input may be provided as one of: a UTF-8 text file path (e.g., `<PATH_TO_LOG>`), an uploaded plain-text file, or a pasted conversation text blob.
+- Conversation format: plain text containing message blocks. Blocks begin with a role marker at the start of a line, such as `User:`, `Assistant:`, `System:`, etc.
+- Only process blocks that begin with a `User:` role marker. All other role blocks must be ignored entirely.
+- If the very first line of the document has no role marker, treat the first block as a `User:` block.
+
+Step-by-Step Instructions (definite, unambiguous):
+1. Read the entire conversation log as UTF-8 text.
+2. Split the text into lines and identify block boundary lines that begin with a role marker. A role marker is recognized only when it appears at the start of a line (allowing leading whitespace) and matches the regex `^\s*User:\s*` for User blocks. Do NOT treat role-marker-like text inside code blocks, quote blocks, or non-line-start positions as markers.
+3. Extract every `User:` block by taking the block start line (including any text after `User:` on that line) and all subsequent lines up to (but not including) the next role-marker line or end-of-document.
+4. Apply block filtering:
+   - Completely ignore any `User:` block whose content is a flow-control, confirmation, or abort command only. Treat the following case-insensitively and ignoring surrounding whitespace as examples of such blocks to ignore: `@agent Continue`, `Continue`, `继续`, `请继续`, `Yes`, `OK`, `确认`, `同意`, `Stop`, `取消`, `停止`.
+   - If a `User:` block contains substantive content in addition to a small reference to a flow-control phrase (e.g., `@agent Continue: "xyz"`), keep the block and treat the flow-control text as ordinary content (do not remove adjacent substantive content unless the entire block is just the flow-control word/phrase).
+5. After filtering, let the remaining blocks be the set of valid User blocks. Apply conflict resolution rules:
+   - If there are zero valid User blocks → write exactly `ERROR: No valid user input found in the conversation log.` to `final_prompt.txt` and stop.
+   - If exactly one valid User block remains → write that block's content verbatim to `final_prompt.txt` (preserve original language and formatting) and stop.
+   - If multiple valid User blocks remain → merge their requirements into a single consolidated, unambiguous, executable English prompt by:
+       a. Extracting explicit requirements, constraints, preferences, and examples from each block.
+       b. When duplicate or overlapping requirements occur, the later (last-occurring) User block takes precedence; remove earlier conflicting requirements.
+       c. Remove redundancies and merge complementary requirements into concise statements.
+       d. If a requirement is vague or under-specified and cannot be resolved by precedence, then write exactly `ERROR: Insufficient or ambiguous requirements. Please provide more specific instructions.` to `final_prompt.txt` and stop.
+6. Construct the final single-turn English prompt using these required sections (include all that apply):
+   - Role & Objective — one-line executor role and core goal.
+   - Inputs & Context — what the LLM will receive, input formats, and where to read the conversation log (file path, upload, or pasted content).
+   - Step-by-Step Instructions — explicit processing steps the LLM must perform (concrete parsing rules, regexes, filters, merging and precedence behavior, and any data transformations).
+   - Output Specification — exact output format and destination: the single-turn prompt text must be written to a file named `final_prompt.txt` encoded in UTF-8 and contain only the prompt text (no additional commentary or metadata).
+   - Constraints & Preferences — explicit style, language (English), placeholders use angle brackets (e.g., `<API_KEY>`, `<DATA_PATH>`), working directory default is current working directory, prohibited phrases (no multi-turn expressions like "continue", "iterate"), and do not create/modify other files.
+   - Quality Gates — concrete verification steps the LLM must run on the conversation log to confirm correctness (e.g., ensure all eligible user requirements are included, last-occurrence precedence is applied, no multi-turn instructions exist, and prompt is single-turn executable). If verification fails, produce an error message starting with `ERROR:` and write it to `final_prompt.txt` (see Error Handling below).
+7. Ensure the final prompt contains no instructions that require additional interactive clarification; it must be single-turn executable and must not ask for further information.
+8. Place the most critical compliance instructions (strict parsing rules, file write boundary, and prohibition of multi-turn words) at the end of the prompt to improve adherence.
+
+Output Specification:
+- Write only the final single-turn English prompt (or the exact `ERROR:` string when applicable) into a file named `final_prompt.txt` in the current working directory with UTF-8 encoding. The file must not contain anything else. Do not create, read, or modify any other files.
+
+Constraints & Preferences:
+- Language: final prompt must be in English unless exactly one valid User block remains (in which case preserve its original language verbatim).
+- Use angle-bracket placeholders for environment-sensitive values (e.g., `<PATH_TO_LOG>`).
+- Do not include vague words; use explicit verbs and verifiable conditions.
+- Do not rely on or reference any non-User blocks in the conversation log.
+- Avoid any wording that implies multi-turn interaction (for example: "continue", "iterate", "to be supplemented", "if more is needed").
+- The final prompt must be single-turn completable and contain all necessary instructions and verification steps.
+
+Quality Gates (self-verification):
+1. Confirm the parser recognizes User blocks using `^\s*User:\s*` and ignores non-User role markers.
+2. Confirm flow-control/confirmation blocks were filtered per rules.
+3. Confirm that if multiple User blocks exist, the final prompt reflects the last-occurrence precedence for conflicting requirements.
+4. Confirm the final prompt contains no multi-turn phrases and is strictly actionable in one run.
+5. If verification passes, write the final prompt to `final_prompt.txt`; if any gate fails, write an appropriate `ERROR:` message to `final_prompt.txt` (one of the three allowed error formats below).
+
+Error Handling (exact strings to write to `final_prompt.txt`):
+- No valid user blocks: `ERROR: No valid user input found in the conversation log.`
+- Insufficient/ambiguous requirements: `ERROR: Insufficient or ambiguous requirements. Please provide more specific instructions.`
+- Internal unresolved contradictions: `ERROR: Conflicting requirements detected: [brief description of conflict]`
+
+Final Critical Instructions (place these at the end and follow them strictly):
+- ONLY read the conversation log to extract `User:` blocks as defined above; IGNORE all non-`User:` blocks entirely.
+- DO NOT create, read, or modify any files except for writing the single output file `final_prompt.txt` (UTF-8) in the current working directory.
+- DO NOT emit any extraneous text; the output file must contain only the single-turn prompt text (or the exact `ERROR:` string when applicable).
+- DO NOT ask clarifying questions; make reasonable inferences where necessary and follow the precedence rules.
+- ENSURE the final prompt is self-contained, single-turn executable, and free from multi-turn wording.
