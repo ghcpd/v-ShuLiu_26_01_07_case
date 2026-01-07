@@ -132,3 +132,34 @@ def test_trace_payload_is_copied() -> None:
     stored = tracer.events[0]
     assert stored["endpoint"] == "x"
     assert stored["meta"]["a"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_async_traces_equivalent() -> None:
+    # ensure sync and async execution emit the same trace event sequence/payloads
+    tracer_sync = TraceSink()
+    tracer_async = TraceSink()
+
+    transport_sync = DummyTransport()
+    transport_async = DummyTransport()
+
+    endpoints = {
+        "ok": EndpointConfig(name="ok", method="GET", url="/ok", retries=0),
+    }
+
+    engine_sync = ApiEngine(endpoints=endpoints, transport=transport_sync, tracer=tracer_sync, default_headers={"X-Default": "1"})
+    engine_async = ApiEngine(endpoints=endpoints, transport=transport_async, tracer=tracer_async, default_headers={"X-Default": "1"})
+
+    transport_sync.queue_response("/ok", {"status": 200, "body": json.dumps({"v": 1})})
+    transport_async.queue_response("/ok", {"status": 200, "body": json.dumps({"v": 1})})
+
+    engine_sync.call_sync({}, "ok", "{}")
+    await engine_async.call_async({}, "ok", "{}")
+
+    # Compare event types and canonical payload keys (order should match)
+    assert [e["type"] for e in tracer_sync.events] == [e["type"] for e in tracer_async.events]
+    # ensure each event payload (minus `type`) is equal
+    for a, b in zip(tracer_sync.events, tracer_async.events):
+        aa = {k: v for k, v in a.items() if k != "type"}
+        bb = {k: v for k, v in b.items() if k != "type"}
+        assert aa == bb
