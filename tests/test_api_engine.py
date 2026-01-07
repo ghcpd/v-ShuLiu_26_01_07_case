@@ -109,6 +109,26 @@ def test_retry_and_timeout_mapping_sync() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retry_and_timeout_mapping_async() -> None:
+    engine = make_engine()
+    endpoint = engine._endpoints["retry"]
+
+    # first: timeout, then 500, then 500 (no more retries)
+    engine._transport.queue_async_error("/retry", asyncio.TimeoutError())
+    engine._transport.queue_response("/retry", {"status": 500, "body": "{}"})
+    engine._transport.queue_response("/retry", {"status": 500, "body": "{}"})
+
+    result = await engine.call_async({}, "retry", "{}")
+
+    assert result["ok"] is False
+    # final error from status mapping
+    assert result["error"] == "upstream_error:500"
+
+    types = [e["type"] for e in engine.tracer.events]
+    assert "request.retry" in types
+
+
+@pytest.mark.asyncio
 async def test_async_behaves_like_sync_success() -> None:
     engine = make_engine()
     engine._transport.queue_response("/ok", {"status": 200, "body": json.dumps({"v": 1})})
