@@ -1,0 +1,108 @@
+Role & Objective
+You are a senior Python engineer working in a small but realistic codebase that implements a thin HTTP API orchestration layer on top of multiple downstream services. Your task is to refactor the existing implementation to reduce duplication and clarify responsibilities in the API layer, while strictly preserving all externally observable behavior. This is a refactor, not a rewrite.
+
+Inputs & Context
+- You are working in a repository that already contains a working implementation and tests:
+  - api_engine.py — API orchestration implementation.
+  - tests/test_api_engine.py — pytest suite.
+- The engine exposes a small, stable API surface that other components use to call downstream HTTP services.
+- The public API surface must remain exactly as it is today:
+  - ApiEngine.call_sync(ctx, endpoint_name, raw_payload)
+  - ApiEngine.call_async(ctx, endpoint_name, raw_payload)
+- Where:
+  - ctx is a per-request context (IDs, settings, etc.).
+  - endpoint_name resolves to an endpoint configuration.
+  - raw_payload is a raw JSON string (or similar) interpreted by the engine.
+
+Step-by-Step Instructions
+1. Open api_engine.py and tests/test_api_engine.py and read them fully to understand the existing behavior, including edge cases and quirks enforced by the tests.
+2. Identify duplicated logic between the synchronous and asynchronous paths, especially for:
+   - Parsing and validating raw_payload.
+   - Resolving endpoint configuration from endpoint_name.
+   - Constructing HTTP requests (URL, headers, query parameters, body serialization).
+   - Retry and timeout handling.
+   - Normalizing responses.
+   - Mapping underlying failures to domain-level error codes.
+   - Emitting trace/log events.
+3. Design a refactoring that removes structural duplication while keeping the call sequence semantically identical:
+   - The high-level sequence must remain: resolve endpoint → build request → send request → normalize response → map errors → emit events.
+   - Ensure that any subtle behaviors, ordering of operations, and trace/log emission sequences stay the same.
+4. Introduce a small number of clearly named internal helpers or internal classes inside api_engine.py to centralize common logic, for example:
+   - Helper(s) for parsing and validating raw_payload.
+   - Helper(s) for resolving endpoint configuration and handling unknown endpoints.
+   - Helper(s) for building and merging headers in the correct precedence order.
+   - Helper(s) for executing the retry loop, handling timeouts, and mapping network errors.
+   - Helper(s) for normalizing/decoding responses and mapping HTTP status codes to domain-level error categories.
+   - Helper(s) for emitting trace/log events at all required lifecycle points.
+5. Ensure the following behavior invariants remain strictly preserved:
+   - Endpoint Resolution & Defaults:
+     - Endpoint configuration from endpoint_name keeps the same defaults (base URL, HTTP method, per-endpoint timeout, retry policy, etc.).
+     - Unknown endpoints still produce the existing error category instead of throwing raw exceptions.
+   - Request Construction:
+     - Headers are built by merging engine defaults, endpoint headers, and per-call overrides from ctx in the same precedence order as before.
+     - Query parameters and bodies are serialized and encoded the same way, including handling of None, empty values, and JSON encoding errors.
+   - Error Mapping:
+     - HTTP status codes and network errors continue to map to the same domain-level error categories as before.
+     - Timeouts, connection failures, protocol errors, JSON decode failures, and schema mismatches keep their existing categories.
+     - The mapping from underlying exceptions to error strings must not change.
+   - Sync vs Async Semantics:
+     - call_sync and call_async remain behaviorally equivalent for both success and failure, differing only in execution model.
+     - Any existing special handling for nested or already-running event loops and how such errors are wrapped must be preserved if present.
+   - Tracing / Logging Events:
+     - The engine continues to emit trace or log events for key lifecycle moments: resolve endpoint, build request, dispatch start/end, error mapping, and similar phases.
+     - Event names, payload fields, and their order must not change, including any copying of payloads before emission.
+   - Caching / Idempotency (If Present):
+     - Any existing cache or idempotency behavior must keep the same keys, short-circuit rules, and avoidance of extra work on cache hits.
+6. While refactoring, maintain the public API exactly:
+   - Do not rename call_sync or call_async.
+   - Do not change their parameters, argument order, or calling conventions.
+   - Do not change the type or structure of returned objects (field names, meanings, or error category strings).
+   - Any new helpers or internal abstractions must be internal and must not alter the external contract.
+7. Keep api_engine.py easy to navigate and reason about:
+   - Prefer straightforward, concrete abstractions over generic frameworks.
+   - Avoid introducing complex patterns that make the code harder to understand.
+   - Minimize diff noise: do not perform unrelated renaming or reformatting.
+8. Ensure all existing tests in tests/test_api_engine.py stay valid and unchanged:
+   - You may add new tests only to tighten behavior (e.g., covering sync vs async equivalence, trace payload immutability, retry boundaries, or cache semantics).
+   - Do not broaden or relax any existing behavior.
+9. Implement a simple run_tests entrypoint script in the project root that:
+   - Uses the Python standard library to set up a reusable local virtual environment.
+   - Installs required dependencies (pytest and any existing test-only dependencies) into that environment.
+   - Runs the full pytest suite (at least tests/test_api_engine.py) from the project root.
+   - Allows verification of behavior preservation by running ./run_tests on Unix-like systems or an equivalent command on Windows.
+10. After refactoring, run the test suite using pytest to confirm that:
+    - All tests pass without modification.
+    - The refactor preserves all externally observable behavior.
+
+Output Specification
+- Produce a refactored version of api_engine.py in-place that:
+  - Keeps the same public API and observable behavior.
+  - Reduces duplication between call_sync and call_async by centralizing shared logic.
+  - Maintains error categories, trace/log event types and payloads, request/response shapes, and all edge-case behaviors.
+- Keep tests/test_api_engine.py unchanged, except for any strictly additive tests that further lock in the behavior (optional and only if they do not relax existing constraints).
+- Provide a run_tests entrypoint script at the project root that can be run as ./run_tests (Unix-like) or via an equivalent command on Windows to:
+  - Create or reuse a virtual environment.
+  - Install pytest and any necessary dependencies.
+  - Run the pytest suite.
+
+Constraints & Preferences
+- Use pytest as the test runner.
+- Do not introduce any new runtime dependencies beyond the Python standard library and pytest.
+- Do not change public-facing interfaces or external entrypoints.
+- Maintain all existing behavior, including subtle edge cases, error codes, and logging/tracing semantics.
+- Focus refactoring on removing duplication between call_sync and call_async and clarifying control flow, not on redesigning the system.
+- Minimize unrelated changes: avoid drive-by renames, style changes, or reformatting that are not necessary for the refactor.
+
+Quality Gates
+- The refactor must be single-pass complete: do not rely on follow-up interactions.
+- All existing tests in tests/test_api_engine.py must pass without modification after the refactor.
+- Any new tests (if added) must only further constrain behavior, not loosen it.
+- Verify that:
+  - The public API signatures are unchanged.
+  - The return shapes and error category strings are exactly as before.
+  - The sequence and content of trace/log events match the original behavior.
+  - Retry logic, timeouts, and error mappings behave identically under the same conditions.
+- Treat any failing test or behavior change as a defect and adjust the refactor until all tests pass and behavior is preserved.
+
+Critical Instruction (Highest Priority)
+You must strictly preserve all externally observable behavior (including public API, return shapes, error category strings, trace/log semantics, retry behavior, and edge cases) while refactoring api_engine.py to reduce duplication and clarify responsibility boundaries, and you must ensure that all existing tests continue to pass without modification.

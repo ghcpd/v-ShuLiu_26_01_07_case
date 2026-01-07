@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""
+Simple test runner script for the API Engine refactor.
+
+Sets up a local virtual environment, installs dependencies, and runs pytest.
+"""
+
+import subprocess
+import sys
+import venv
+from pathlib import Path
+
+
+def main():
+    """Set up environment and run tests."""
+    project_root = Path(__file__).parent
+    venv_dir = project_root / ".venv"
+    
+    # Create virtual environment if it doesn't exist
+    if not venv_dir.exists():
+        print(f"Creating virtual environment at {venv_dir}...")
+        venv.create(venv_dir, with_pip=True)
+    
+    # Determine the Python executable in the venv
+    if sys.platform == "win32":
+        python_exe = venv_dir / "Scripts" / "python.exe"
+        pip_exe = venv_dir / "Scripts" / "pip.exe"
+    else:
+        python_exe = venv_dir / "bin" / "python"
+        pip_exe = venv_dir / "bin" / "pip"
+    
+    # Install test dependencies
+    print("Installing dependencies...")
+    subprocess.check_call([str(pip_exe), "install", "-q", "pytest", "pytest-asyncio"])
+    
+    # Run pytest
+    print("\nRunning tests...")
+    result = subprocess.call(
+        [str(python_exe), "-m", "pytest", "tests/test_api_engine.py", "-v"],
+        cwd=str(project_root),
+    )
+    
+    sys.exit(result)
+
+
+if __name__ == "__main__":
+    main()
