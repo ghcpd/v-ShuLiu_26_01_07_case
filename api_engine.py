@@ -258,33 +258,44 @@ class ApiEngine:
                     "error": "network_error",
                 }
 
-            status = response.get("status")
-            body = response.get("body")
+            post = self._post_process_response(endpoint_name, endpoint, attempt, response)
+            if post is None:
+                continue
+            return post
+
+    def _post_process_response(self, endpoint_name: str, endpoint: EndpointConfig, attempt: int, response: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Handle common post-request processing: emit end, check retry, normalize body.
+
+        Returns a result dict when no retry is needed, or None when caller should retry.
+        """
+        status = response.get("status")
+        body = response.get("body")
+        self._tracer.emit(
+            "request.end",
+            {
+                "endpoint": endpoint_name,
+                "attempt": attempt,
+                "status": status,
+            },
+        )
+
+        # Check if we should retry
+        if status in endpoint.retry_statuses and attempt <= endpoint.retries:
             self._tracer.emit(
-                "request.end",
+                "request.retry",
                 {
                     "endpoint": endpoint_name,
                     "attempt": attempt,
                     "status": status,
                 },
             )
+            return None
 
-            # Check if we should retry
-            if status in endpoint.retry_statuses and attempt <= endpoint.retries:
-                self._tracer.emit(
-                    "request.retry",
-                    {
-                        "endpoint": endpoint_name,
-                        "attempt": attempt,
-                        "status": status,
-                    },
-                )
-                continue
-
-            # Normalize and return response
-            return self._normalize_and_return_response(endpoint_name, status, body)
+        # Normalize and return response
+        return self._normalize_and_return_response(endpoint_name, status, body)
 
     def _normalize_and_return_response(self, endpoint_name: str, status: int, body: Any) -> Dict[str, Any]:
+
         """Normalize response body and return appropriate result based on status."""
         data, normalize_error = self._normalize_response_body(body)
         
@@ -390,28 +401,7 @@ class ApiEngine:
                     "error": "network_error",
                 }
 
-            status = response.get("status")
-            body = response.get("body")
-            self._tracer.emit(
-                "request.end",
-                {
-                    "endpoint": endpoint_name,
-                    "attempt": attempt,
-                    "status": status,
-                },
-            )
-
-            # Check if we should retry
-            if status in endpoint.retry_statuses and attempt <= endpoint.retries:
-                self._tracer.emit(
-                    "request.retry",
-                    {
-                        "endpoint": endpoint_name,
-                        "attempt": attempt,
-                        "status": status,
-                    },
-                )
+            post = self._post_process_response(endpoint_name, endpoint, attempt, response)
+            if post is None:
                 continue
-
-            # Normalize and return response
-            return self._normalize_and_return_response(endpoint_name, status, body)
+            return post
